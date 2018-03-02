@@ -501,7 +501,8 @@ namespace similarity {
 
         void add(const Space<dist_t> *space, HnswNode *newElement);
         void addToElementListSynchronized(HnswNode *newElement);
-
+        
+        // Bidirectional linking of two nodes in graph
         void link(HnswNode *first, HnswNode *second, int level, const Space<dist_t> *space, int delaunay_type)
         {
             // We have to pass the Space, since we need to know what elements can be

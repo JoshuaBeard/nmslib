@@ -68,6 +68,9 @@
 #define FIELD_MAX_M0    "MAX_M0"
 #define CURR_LEVEL      "CURR_LEVEL"
 
+
+//TODO Figure out what "IndexTimeDistance()" does specifically
+
 namespace similarity {
 
     // This is the counter to keep the size of neighborhood information (for one node)
@@ -207,6 +210,8 @@ namespace similarity {
 
         ParallelFor(1, this->data_.size(), indexThreadQty_, [&](int id, int threadId) {
             HnswNode *node = new HnswNode(this->data_[id], id);
+
+            // Insert node
             add(&space_, node);
             {
                 unique_lock<mutex> lock(ElListGuard_);
@@ -217,7 +222,7 @@ namespace similarity {
         });
         if (progress_bar)
           progress_bar->finish();
-
+        // TODO what's post?
         if (post_ == 1 || post_ == 2) {
             vector<HnswNode *> temp;
             temp.swap(ElList_);
@@ -230,6 +235,7 @@ namespace similarity {
             /// Making the same index in reverse order
             unique_ptr<ProgressDisplay> progress_bar1(PrintProgress_ ? new ProgressDisplay(this->data_.size(), cerr) : NULL);
 
+            // Insertion
             ParallelFor(1, this->data_.size(), indexThreadQty_, [&](int pos_id, int threadId) {
                 // reverse ordering (so we iterate decreasing). given
                 // parallelfor, this might not make a difference
@@ -248,8 +254,19 @@ namespace similarity {
             int maxF = 0;
 
 // int degrees[100] = {0};
+
+
+
+            //   TODO is my interpretation correct? 
+            // /                                    \
+            // |                                    |
+            // V                                    V
+            // Pruning to ensure $n_connections < M_max$ 
             ParallelFor(1, this->data_.size(), indexThreadQty_, [&](int id, int threadId) {
+                // Get every node
                 HnswNode *node1 = ElList_[id];
+
+                // temp holds what ElList_ used to hold?
                 HnswNode *node2 = temp[id];
                 vector<HnswNode *> f1 = node1->getAllFriends(0);
                 vector<HnswNode *> f2 = node2->getAllFriends(0);
@@ -501,32 +518,48 @@ namespace similarity {
     void
     Hnsw<dist_t>::add(const Space<dist_t> *space, HnswNode *NewElement)
     {
+        // Generate random level from exponential distribution
         int curlevel = getRandomLevel(mult_);
+
+        // Synchronization
         unique_lock<mutex> *lock = nullptr;
         if (curlevel > maxlevel_)
             lock = new unique_lock<mutex>(MaxLevelGuard_);
 
+        // Initialize new node
         NewElement->init(curlevel, maxM_, maxM0_);
 
+        // Get max level and entry point
         int maxlevelcopy = maxlevel_;
         HnswNode *ep = enterpoint_;
+
+        // If new node is to be inserted in preexisting level
         if (curlevel < maxlevelcopy) {
             const Object *currObj = ep->getData();
 
+            // Get distance from new node to entry point
             dist_t d = space->IndexTimeDistance(NewElement->getData(), currObj);
             dist_t curdist = d;
             HnswNode *curNode = ep;
+
+            // Starting coarse, go thru every level > new node's level
             for (int level = maxlevelcopy; level > curlevel; level--) {
                 bool changed = true;
                 while (changed) {
                     changed = false;
                     unique_lock<mutex> lock(curNode->accessGuard_);
+
+                    // Get neighbors (or "friends") of current node (initially entry point)
                     const vector<HnswNode *> &neighbor = curNode->getAllFriends(level);
                     int size = neighbor.size();
+
+                    // Prefetch all neighbors so they're likely in cache when we try to access them
                     for (int i = 0; i < size; i++) {
                         HnswNode *node = neighbor[i];
                         _mm_prefetch((char *)(node)->getData(), _MM_HINT_T0);
                     }
+
+                    // Find nearest neighbor
                     for (int i = 0; i < size; i++) {
                         currObj = (neighbor[i])->getData();
                         d = space->IndexTimeDistance(NewElement->getData(), currObj);
@@ -538,15 +571,26 @@ namespace similarity {
                     }
                 }
             }
+            // Entry point for next level down is nearest neighbor at this level
             ep = curNode;
         }
+        
 
+        // Starting at insertion level, go to finest level
         for (int level = min(curlevel, maxlevelcopy); level >= 0; level--) {
+
+            // Max pri queue
             priority_queue<HnswNodeDistCloser<dist_t>> resultSet;
-            kSearchElementsWithAttemptsLevel(space, NewElement->getData(), efConstruction_, resultSet, ep, level);
+            kSearchElementsWithAttemptsLevel( space,
+                                              NewElement->getData(),
+                                              efConstruction_, 
+                                              resultSet, 
+                                              ep, 
+                                              level);
 
             switch (delaunay_type_) {
             case 0:
+                // Remove farthest neighbors until set is not too big
                 while (resultSet.size() > M_)
                     resultSet.pop();
                 break;
@@ -560,9 +604,18 @@ namespace similarity {
                 NewElement->getNeighborsByHeuristic3(resultSet, M_, space, level);
                 break;
             }
+
             while (!resultSet.empty()) {
+                // Closest node is entry point for next level
                 ep = resultSet.top().getMSWNodeHier(); // memorizing the closest
-                link(resultSet.top().getMSWNodeHier(), NewElement, level, space, delaunay_type_);
+
+                // Bidirectionally link new node with each in resultSet
+                // TODO I don't notice anything about max number of connections
+                link( resultSet.top().getMSWNodeHier(),
+                      NewElement, 
+                      level, 
+                      space, 
+                      delaunay_type_);
                 resultSet.pop();
             }
         }
