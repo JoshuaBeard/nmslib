@@ -150,30 +150,47 @@ namespace similarity {
         out.close();
         return;
     }
+    
+    
+    // Creation of the search index data structure
+    /*
+    Adds a single node as the entry point and consecutively adds the rest
+    Options include:
+    - post_: {0,1,2}
+        - Creates reverse ordering of nodes in similar data structure to improve search
+           performance at cost of slower build time and more memory usage
+    */
     template <typename dist_t>
     void
     Hnsw<dist_t>::CreateIndex(const AnyParams &IndexParams)
     {
         AnyParamManager pmgr(IndexParams);
 
+        // Number of neighbors to search for when making connections
         pmgr.GetParamOptional("M", M_, 16);
 
         // Let's use a generic algorithm by default!
-        pmgr.GetParamOptional(
-            "searchMethod", searchMethod_, 0); // this is just to prevent terminating the program when searchMethod is specified
+        // This prevents terminating the program when searchMethod is specified
+        pmgr.GetParamOptional("searchMethod", searchMethod_, 0);
         searchMethod_ = 0;
 
+        // How many threads to use
         indexThreadQty_ = std::thread::hardware_concurrency();
-
         pmgr.GetParamOptional("indexThreadQty", indexThreadQty_, indexThreadQty_);
         // indexThreadQty_ = 1;
+
+        // TODO what does this do again?
         pmgr.GetParamOptional("efConstruction", efConstruction_, 200);
         pmgr.GetParamOptional("maxM", maxM_, M_);
         pmgr.GetParamOptional("maxM0", maxM0_, M_ * 2);
         pmgr.GetParamOptional("mult", mult_, 1 / log(1.0 * M_));
         pmgr.GetParamOptional("delaunay_type", delaunay_type_, 2);
+
+        // Option to create a reversed index for better performance at high recall
+        // Roughly doubles index build time and space requirements
         int post_;
         pmgr.GetParamOptional("post", post_, 0);
+        // TODO what does this do?
         int skip_optimized_index = 0;
         pmgr.GetParamOptional("skip_optimized_index", skip_optimized_index, 0);
 
@@ -194,7 +211,9 @@ namespace similarity {
             return;
         }
         ElList_.resize(this->data_.size());
-        // One entry should be added before all the threads are started, or else add() will not work properly
+
+        // One entry should be added before all the threads are started,
+        //  or else add() will not work properly
         HnswNode *first = new HnswNode(this->data_[0], 0 /* id == 0 */);
         first->init(getRandomLevel(mult_), maxM_, maxM0_);
         maxlevel_ = first->level;
@@ -205,6 +224,7 @@ namespace similarity {
 
         unique_ptr<ProgressDisplay> progress_bar(PrintProgress_ ? new ProgressDisplay(this->data_.size(), cerr) : NULL);
 
+        // Inserts one element at a time to build index
         ParallelFor(1, this->data_.size(), indexThreadQty_, [&](int id, int threadId) {
             HnswNode *node = new HnswNode(this->data_[id], id);
             add(&space_, node);
@@ -218,6 +238,7 @@ namespace similarity {
         if (progress_bar)
           progress_bar->finish();
 
+        // Optionally build reverse-ordered index
         if (post_ == 1 || post_ == 2) {
             vector<HnswNode *> temp;
             temp.swap(ElList_);
@@ -227,6 +248,7 @@ namespace similarity {
             maxlevel_ = first->level;
             enterpoint_ = first;
             ElList_[0] = first;
+
             /// Making the same index in reverse order
             unique_ptr<ProgressDisplay> progress_bar1(PrintProgress_ ? new ProgressDisplay(this->data_.size(), cerr) : NULL);
 
@@ -247,19 +269,24 @@ namespace similarity {
             });
             int maxF = 0;
 
-// int degrees[100] = {0};
+            // int degrees[100] = {0};
+            // TODO: `intersect` functions more like a set union, so probably change name
             ParallelFor(1, this->data_.size(), indexThreadQty_, [&](int id, int threadId) {
                 HnswNode *node1 = ElList_[id];
                 HnswNode *node2 = temp[id];
                 vector<HnswNode *> f1 = node1->getAllFriends(0);
                 vector<HnswNode *> f2 = node2->getAllFriends(0);
                 unordered_set<size_t> intersect = unordered_set<size_t>();
+
+                // Get IDs of all friends of node1 and node2
                 for (HnswNode *cur : f1) {
                     intersect.insert(cur->getId());
                 }
                 for (HnswNode *cur : f2) {
                     intersect.insert(cur->getId());
                 }
+
+                // update max number of friends
                 if (intersect.size() > maxF)
                     maxF = intersect.size();
                 vector<HnswNode *> rez = vector<HnswNode *>();
@@ -497,6 +524,8 @@ namespace similarity {
             delete p;
     }
 
+
+    // Node insertion
     template <typename dist_t>
     void
     Hnsw<dist_t>::add(const Space<dist_t> *space, HnswNode *NewElement)
@@ -511,11 +540,14 @@ namespace similarity {
         int maxlevelcopy = maxlevel_;
         HnswNode *ep = enterpoint_;
         if (curlevel < maxlevelcopy) {
-            const Object *currObj = ep->getData();
 
+            // Get distance from new node and this level's entry point
+            const Object *currObj = ep->getData();
             dist_t d = space->IndexTimeDistance(NewElement->getData(), currObj);
             dist_t curdist = d;
             HnswNode *curNode = ep;
+
+            // Nearest neighbor in each level becomes entry point to deeper level
             for (int level = maxlevelcopy; level > curlevel; level--) {
                 bool changed = true;
                 while (changed) {
@@ -523,10 +555,15 @@ namespace similarity {
                     unique_lock<mutex> lock(curNode->accessGuard_);
                     const vector<HnswNode *> &neighbor = curNode->getAllFriends(level);
                     int size = neighbor.size();
+
+                    // Prefetch neighbors so they're in cache
+                    // TODO: Can this be parallelized for speed?
                     for (int i = 0; i < size; i++) {
                         HnswNode *node = neighbor[i];
                         _mm_prefetch((char *)(node)->getData(), _MM_HINT_T0);
                     }
+
+                    // Find nearest neighbor at this level
                     for (int i = 0; i < size; i++) {
                         currObj = (neighbor[i])->getData();
                         d = space->IndexTimeDistance(NewElement->getData(), currObj);
@@ -538,13 +575,17 @@ namespace similarity {
                     }
                 }
             }
+
+            // Update entry point to nearest neighbor at this level
             ep = curNode;
         }
 
+        // Connect this node with friends at all levels at and below its level
         for (int level = min(curlevel, maxlevelcopy); level >= 0; level--) {
             priority_queue<HnswNodeDistCloser<dist_t>> resultSet;
             kSearchElementsWithAttemptsLevel(space, NewElement->getData(), efConstruction_, resultSet, ep, level);
 
+            // Different NN search heuristics
             switch (delaunay_type_) {
             case 0:
                 while (resultSet.size() > M_)
@@ -560,12 +601,16 @@ namespace similarity {
                 NewElement->getNeighborsByHeuristic3(resultSet, M_, space, level);
                 break;
             }
+
+            // Bidirectionally link each neighbor, recording closest for next level's search
             while (!resultSet.empty()) {
                 ep = resultSet.top().getMSWNodeHier(); // memorizing the closest
                 link(resultSet.top().getMSWNodeHier(), NewElement, level, space, delaunay_type_);
                 resultSet.pop();
             }
         }
+
+        // Update graph's maximum level if needed
         if (curlevel > enterpoint_->level) {
             enterpoint_ = NewElement;
             maxlevel_ = curlevel;
@@ -573,6 +618,7 @@ namespace similarity {
         if (lock != nullptr)
             delete lock;
     }
+
 
     template <typename dist_t>
     void
